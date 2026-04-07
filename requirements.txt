@@ -1,0 +1,7 @@
+alpaca-py==0.17.0
+matplotlib
+pandas==3.0.2
+pandas_ta==0.4.71b0
+python-dotenv==1.0.1
+pytz==2026.1.post1
+pytest==8.1.1
