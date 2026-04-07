@@ -193,10 +193,10 @@ def submit_entry_with_exits(
         exit_order = LimitOrderRequest(
             symbol=symbol,
             qty=qty,
+            limit_price=tp_price,
             side=OrderSide.SELL,
             time_in_force=TimeInForce.GTC,
             order_class=OrderClass.OCO,
-            take_profit=TakeProfitRequest(limit_price=tp_price),
             stop_loss=StopLossRequest(stop_price=sl_price),
         )
 
