@@ -38,9 +38,11 @@ def get_report_date() -> str:
 
 
 def read_log_lines(date_str: str) -> list[str]:
-    """Extract all log lines for the given date from both log files."""
+    """Extract all log lines for the given date."""
     lines = []
-    for path in [LOG_FILE, SERVICE_LOG]:
+    # Prefer service.log (captures stdout+stderr), fall back to engine.log
+    log_path = SERVICE_LOG if SERVICE_LOG.exists() else LOG_FILE
+    for path in [log_path]:
         if not path.exists():
             continue
         with open(path) as f:
