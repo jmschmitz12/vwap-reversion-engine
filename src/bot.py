@@ -10,6 +10,7 @@ import pandas as pd
 
 from config.settings import (
     ALLOCATION_PERCENT,
+    MAX_OPEN_POSITIONS,
     RSI_OVERSOLD,
     TARGET_SYMBOLS,
     TRADING_END_HOUR_UTC,
@@ -20,7 +21,6 @@ from src.data import fetch_intraday_data
 from src.execution import (
     get_buying_power,
     get_open_position_symbols,
-    has_capacity_for_new_position,
     submit_entry_with_exits,
     trading_client,
 )
@@ -38,18 +38,12 @@ def _calculate_position_size(
     return int(allocated_cash // current_price)
 
 
-def _is_market_open() -> bool:
-    """Return ``True`` if the market is currently in a regular session."""
-    try:
-        clock = trading_client.get_clock()
-        return clock.is_open
-    except Exception as exc:
-        logger.error("Failed to check market clock: %s", exc)
-        return False
-
-
 def _is_in_trading_window() -> bool:
-    """Return ``True`` if the current UTC time falls within the entry window."""
+    """Return ``True`` if the current UTC time falls within the entry window.
+
+    This is a FREE check (no API call) — always run this before
+    _is_market_open() to avoid unnecessary Alpaca requests.
+    """
     from datetime import datetime, timezone
 
     now = datetime.now(timezone.utc)
@@ -57,6 +51,20 @@ def _is_in_trading_window() -> bool:
     end = TRADING_END_HOUR_UTC * 60 + TRADING_END_MINUTE_UTC
     current = now.hour * 60 + now.minute
     return start <= current <= end
+
+
+def _is_market_open() -> bool:
+    """Return ``True`` if the market is currently in a regular session.
+
+    This makes an API call to Alpaca — only call after confirming
+    we're inside the trading window.
+    """
+    try:
+        clock = trading_client.get_clock()
+        return clock.is_open
+    except Exception as exc:
+        logger.error("Failed to check market clock: %s", exc)
+        return False
 
 
 def run_bot_iteration(symbols: list[str] | None = None) -> None:
@@ -69,16 +77,28 @@ def run_bot_iteration(symbols: list[str] | None = None) -> None:
     active_symbols = symbols or TARGET_SYMBOLS
     logger.info("-- Starting analysis cycle (%d symbols) --", len(active_symbols))
 
-    # -- Pre-flight checks --
-    if not _is_market_open():
-        logger.info("Market is closed -- skipping this cycle.")
-        return
+    # -- Pre-flight checks (ordered cheapest-first) --
 
+    # 1. Trading window (free local check — no API call)
     if not _is_in_trading_window():
         logger.info("Outside trading window (17:00-19:30 UTC) -- skipping entries.")
         return
 
-    if not has_capacity_for_new_position():
+    # 2. Market open (API call — only reached during the window)
+    if not _is_market_open():
+        logger.info("Market is closed -- skipping this cycle.")
+        return
+
+    # 3. Position capacity (single API call — get current positions)
+    open_symbols: set[str] = get_open_position_symbols()
+    current_position_count = len(open_symbols)
+
+    if current_position_count >= MAX_OPEN_POSITIONS:
+        logger.info(
+            "At position cap (%d/%d) -- no new entries allowed.",
+            current_position_count,
+            MAX_OPEN_POSITIONS,
+        )
         return
 
     # -- Data & Indicators --
@@ -90,18 +110,16 @@ def run_bot_iteration(symbols: list[str] | None = None) -> None:
     if df is None:
         return
 
-    # Avoid stacking entries on tickers we already hold.
-    open_symbols: set[str] = get_open_position_symbols()
-
     # -- Signal Scan --
     for symbol in active_symbols:
+        # Check capacity using local counter (no API call)
+        if current_position_count >= MAX_OPEN_POSITIONS:
+            logger.info("Position cap reached during scan -- stopping.")
+            break
+
         if symbol in open_symbols:
             logger.info("[%s] Position already open -- skipping.", symbol)
             continue
-
-        # Re-check capacity inside the loop (positions may have been opened)
-        if not has_capacity_for_new_position():
-            break
 
         try:
             symbol_data = df.xs(symbol, level="symbol")
@@ -143,15 +161,17 @@ def run_bot_iteration(symbols: list[str] | None = None) -> None:
                     )
                     continue
 
-                submit_entry_with_exits(
+                result = submit_entry_with_exits(
                     symbol=symbol,
                     qty=qty,
                     signal_price=current_price,
                     atr=atr,
                 )
 
-                # Add to open set so we don't double-enter this cycle
-                open_symbols.add(symbol)
+                # Track locally so we don't need another API call
+                if result is not None:
+                    open_symbols.add(symbol)
+                    current_position_count += 1
 
         except KeyError:
             logger.warning("[%s] No data available -- skipping.", symbol)
