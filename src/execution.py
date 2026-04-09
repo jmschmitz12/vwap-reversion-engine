@@ -6,9 +6,10 @@ fill price rather than the stale candle close:
 
     1. Submit a market buy order.
     2. Poll for fill confirmation and read the fill price.
-    3. Submit an OTO (One-Triggers-Other) exit order — a limit sell
-       at take-profit AND a stop sell at stop-loss — calculated from
-       the real fill price.
+    3. Calculate TP/SL from the real fill price using ATR.
+    4. Submit a limit sell (take-profit) and a stop sell (stop-loss)
+       as separate orders.  Alpaca auto-cancels the remaining leg
+       when one fills because they both target the same position.
 
 This eliminates the fill-price drift bug where bracket exits were
 misaligned because the market moved between signal and fill.
@@ -17,14 +18,11 @@ misaligned because the market moved between signal and fill.
 import time
 
 from alpaca.trading.client import TradingClient
-from alpaca.trading.enums import OrderClass, OrderSide, OrderStatus, TimeInForce
+from alpaca.trading.enums import OrderSide, OrderStatus, TimeInForce
 from alpaca.trading.requests import (
-    GetOrdersRequest,
     LimitOrderRequest,
     MarketOrderRequest,
-    StopLossRequest,
     StopOrderRequest,
-    TakeProfitRequest,
 )
 
 from config.settings import (
@@ -132,8 +130,13 @@ def submit_entry_with_exits(
 ) -> object | None:
     """Submit a market buy, then set exits based on the actual fill price.
 
-    This two-step flow ensures TP and SL are correctly distanced from
-    where you actually entered, not where the signal fired.
+    Exit orders are submitted as two separate orders:
+      - A limit sell at the take-profit price
+      - A stop sell at the stop-loss price
+
+    When one fills (position closed), Alpaca rejects the other because
+    there's no longer a position to sell.  The bot's position tracking
+    handles this gracefully.
 
     Args:
         symbol:       Ticker to trade.
@@ -189,20 +192,35 @@ def submit_entry_with_exits(
             exit_mode,
         )
 
-        # ── Step 4: Submit bracket exit (OCO: TP + SL) ───────────────
-	exit_order = LimitOrderRequest(
+        # ── Step 4: Submit take-profit (limit sell) ──────────────────
+        tp_order = LimitOrderRequest(
             symbol=symbol,
             qty=qty,
             limit_price=tp_price,
             side=OrderSide.SELL,
             time_in_force=TimeInForce.GTC,
-            order_class=OrderClass.OCO,
-            take_profit=TakeProfitRequest(limit_price=tp_price),
-            stop_loss=StopLossRequest(stop_price=sl_price),
         )
 
-        exit_result = trading_client.submit_order(order_data=exit_order)
-        logger.info("Exit orders placed for %s (OCO: %s)", symbol, exit_result.id)
+        tp_result = trading_client.submit_order(order_data=tp_order)
+        logger.info(
+            "TP order placed for %s: sell %d @ $%.2f (order: %s)",
+            symbol, qty, tp_price, tp_result.id,
+        )
+
+        # ── Step 5: Submit stop-loss (stop sell) ─────────────────────
+        sl_order = StopOrderRequest(
+            symbol=symbol,
+            qty=qty,
+            stop_price=sl_price,
+            side=OrderSide.SELL,
+            time_in_force=TimeInForce.GTC,
+        )
+
+        sl_result = trading_client.submit_order(order_data=sl_order)
+        logger.info(
+            "SL order placed for %s: stop sell %d @ $%.2f (order: %s)",
+            symbol, qty, sl_price, sl_result.id,
+        )
 
         record_trade(
             symbol=symbol,
