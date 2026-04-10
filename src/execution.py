@@ -1,28 +1,24 @@
 """
 Order execution and account management via the Alpaca Trading API.
 
-Two-step order flow to ensure exits are calculated from the ACTUAL
-fill price rather than the stale candle close:
+Uses a BRACKET order that atomically creates:
+  - Market buy (entry)
+  - Limit sell (take-profit) as child order
+  - Stop sell (stop-loss) as child order
 
-    1. Submit a market buy order.
-    2. Poll for fill confirmation and read the fill price.
-    3. Calculate TP/SL from the real fill price using ATR.
-    4. Journal the trade IMMEDIATELY (before exit orders).
-    5. Submit a limit sell (take-profit) and a stop sell (stop-loss)
-       as two separate orders, each in its own try/except.
-
-When one exit fills (closing the position), the other becomes
-unfillable and will be rejected by Alpaca automatically.
+Alpaca manages the OCO relationship between TP and SL automatically.
+Exits are calculated from the signal price. Fill-price drift is
+logged for monitoring but does not affect exit placement.
 """
 
 import time
 
 from alpaca.trading.client import TradingClient
-from alpaca.trading.enums import OrderSide, OrderStatus, TimeInForce
+from alpaca.trading.enums import OrderClass, OrderSide, OrderStatus, TimeInForce
 from alpaca.trading.requests import (
-    LimitOrderRequest,
     MarketOrderRequest,
-    StopOrderRequest,
+    StopLossRequest,
+    TakeProfitRequest,
 )
 
 from config.settings import (
@@ -39,36 +35,23 @@ from config.settings import (
 from utils.journal import record_trade
 from utils.logger import logger
 
-# Initialized once at module load; reused across every cycle.
 trading_client = TradingClient(API_KEY, SECRET_KEY, paper=PAPER_TRADING)
 
 
-# ── Account Helpers ──────────────────────────────────────────────────────────
-
-
 def get_buying_power(minimum_required: float = 500.0) -> float | None:
-    """Return available buying power if it exceeds *minimum_required*."""
     try:
         account = trading_client.get_account()
         buying_power = float(account.buying_power)
-
         if buying_power < minimum_required:
-            logger.warning(
-                "Insufficient buying power: $%.2f (minimum: $%.2f)",
-                buying_power,
-                minimum_required,
-            )
+            logger.warning("Insufficient buying power: $%.2f (min: $%.2f)", buying_power, minimum_required)
             return None
-
         return buying_power
-
     except Exception as exc:
         logger.error("Failed to fetch account details: %s", exc)
         return None
 
 
 def get_open_position_symbols() -> set[str]:
-    """Return the set of ticker symbols with currently open positions."""
     try:
         positions = trading_client.get_all_positions()
         return {p.symbol for p in positions}
@@ -78,48 +61,11 @@ def get_open_position_symbols() -> set[str]:
 
 
 def has_capacity_for_new_position() -> bool:
-    """Check whether the bot is below its maximum position count."""
     open_count = len(get_open_position_symbols())
     if open_count >= MAX_OPEN_POSITIONS:
-        logger.info(
-            "At position cap (%d/%d) -- no new entries allowed.",
-            open_count,
-            MAX_OPEN_POSITIONS,
-        )
+        logger.info("At position cap (%d/%d) -- no new entries allowed.", open_count, MAX_OPEN_POSITIONS)
         return False
     return True
-
-
-# ── Fill Price Retrieval ─────────────────────────────────────────────────────
-
-
-def _wait_for_fill(order_id: str, max_wait: int = 10) -> float | None:
-    """Poll Alpaca until the order fills or timeout.
-
-    Args:
-        order_id: The Alpaca order ID to check.
-        max_wait: Maximum seconds to wait for fill.
-
-    Returns:
-        The average fill price, or ``None`` if the order didn't fill.
-    """
-    for _ in range(max_wait * 2):  # Check every 0.5s
-        try:
-            order = trading_client.get_order_by_id(order_id)
-            if order.status == OrderStatus.FILLED:
-                return float(order.filled_avg_price)
-            if order.status in (OrderStatus.CANCELED, OrderStatus.EXPIRED, OrderStatus.REJECTED):
-                logger.warning("Order %s ended with status: %s", order_id, order.status)
-                return None
-        except Exception as exc:
-            logger.warning("Error polling order %s: %s", order_id, exc)
-        time.sleep(0.5)
-
-    logger.warning("Order %s did not fill within %ds", order_id, max_wait)
-    return None
-
-
-# ── Order Submission ─────────────────────────────────────────────────────────
 
 
 def submit_entry_with_exits(
@@ -128,113 +74,68 @@ def submit_entry_with_exits(
     signal_price: float,
     atr: float = 0.0,
 ) -> object | None:
-    """Submit a market buy, then set exits based on the actual fill price.
+    """Submit a bracket order: market buy + TP + SL in one atomic request.
 
-    Exit orders are submitted as two independent orders, each in its
-    own try/except.  The journal records the trade BEFORE exit orders
-    are attempted, so a failed exit never causes a missing record.
-
-    Args:
-        symbol:       Ticker to trade.
-        qty:          Number of whole shares.
-        signal_price: Price at signal time (logged for reference only).
-        atr:          Current ATR value for calculating exit distances.
-
-    Returns:
-        The entry order object on success, or ``None`` if the entry
-        itself failed (exit failures still return the order).
+    Exits are calculated from signal_price. After fill, the actual
+    fill price and drift are logged for monitoring.
     """
-    # ── Step 1: Market buy ───────────────────────────────────────────
+    # ── Calculate exits from signal price ────────────────────────────
+    if USE_ATR_EXITS and atr > 0:
+        tp_price = round(signal_price + (atr * TP_ATR_MULTIPLIER), 2)
+        sl_price = round(signal_price - (atr * SL_ATR_MULTIPLIER), 2)
+        exit_mode = "ATR"
+    else:
+        tp_price = round(signal_price * (1 + TP_PERCENT), 2)
+        sl_price = round(signal_price * (1 - SL_PERCENT), 2)
+        exit_mode = "FIXED"
+
+    # ── Submit bracket order ─────────────────────────────────────────
     try:
-        entry_order = MarketOrderRequest(
+        order = trading_client.submit_order(order_data=MarketOrderRequest(
             symbol=symbol,
             qty=qty,
             side=OrderSide.BUY,
             time_in_force=TimeInForce.DAY,
+            order_class=OrderClass.BRACKET,
+            take_profit=TakeProfitRequest(limit_price=tp_price),
+            stop_loss=StopLossRequest(stop_price=sl_price),
+        ))
+        logger.info(
+            "BRACKET ORDER submitted for %d x %s @ ~$%.2f | TP: $%.2f | SL: $%.2f | %s",
+            qty, symbol, signal_price, tp_price, sl_price, exit_mode,
         )
-        order = trading_client.submit_order(order_data=entry_order)
-        logger.info("Market buy submitted for %d x %s (order: %s)", qty, symbol, order.id)
     except Exception as exc:
-        logger.error("Failed to submit market buy for %s: %s", symbol, exc)
+        logger.error("Bracket order FAILED for %s: %s", symbol, exc)
         return None
 
-    # ── Step 2: Wait for fill ────────────────────────────────────────
-    fill_price = _wait_for_fill(str(order.id))
-
-    if fill_price is None:
-        logger.error("Entry order for %s did not fill. Attempting cancel.", symbol)
-        try:
-            trading_client.cancel_order_by_id(str(order.id))
-        except Exception:
-            pass
-        return None
-
-    # ── Step 3: Calculate exits from FILL price ──────────────────────
-    if USE_ATR_EXITS and atr > 0:
-        tp_price = round(fill_price + (atr * TP_ATR_MULTIPLIER), 2)
-        sl_price = round(fill_price - (atr * SL_ATR_MULTIPLIER), 2)
-        exit_mode = "ATR"
-    else:
-        tp_price = round(fill_price * (1 + TP_PERCENT), 2)
-        sl_price = round(fill_price * (1 - SL_PERCENT), 2)
-        exit_mode = "FIXED"
-
-    logger.info(
-        "FILLED %d x %s @ $%.2f (signal: $%.2f, drift: $%.2f) | TP: $%.2f | SL: $%.2f | %s",
-        qty, symbol, fill_price, signal_price, fill_price - signal_price,
-        tp_price, sl_price, exit_mode,
-    )
-
-    # ── Step 4: Journal IMMEDIATELY — before exit orders ─────────────
+    # ── Journal immediately ──────────────────────────────────────────
     record_trade(
         symbol=symbol,
         side="BUY",
         qty=qty,
-        entry_price=fill_price,
+        entry_price=signal_price,
         take_profit=tp_price,
         stop_loss=sl_price,
         order_id=str(order.id),
     )
 
-    # ── Step 5: Submit take-profit (limit sell) ──────────────────────
-    tp_ok = False
+    # ── Log fill price and drift (non-blocking) ──────────────────────
     try:
-        tp_result = trading_client.submit_order(order_data=LimitOrderRequest(
-            symbol=symbol,
-            qty=qty,
-            limit_price=tp_price,
-            side=OrderSide.SELL,
-            time_in_force=TimeInForce.GTC,
-        ))
-        logger.info("TP order placed for %s: limit sell %d @ $%.2f (order: %s)",
-                     symbol, qty, tp_price, tp_result.id)
-        tp_ok = True
+        for _ in range(20):
+            check = trading_client.get_order_by_id(str(order.id))
+            if check.status == OrderStatus.FILLED:
+                fill_price = float(check.filled_avg_price)
+                drift = fill_price - signal_price
+                logger.info(
+                    "FILL CONFIRMED %s @ $%.2f (signal: $%.2f, drift: $%+.2f)",
+                    symbol, fill_price, signal_price, drift,
+                )
+                break
+            if check.status in (OrderStatus.CANCELED, OrderStatus.EXPIRED, OrderStatus.REJECTED):
+                logger.warning("Order %s ended with status: %s", order.id, check.status)
+                break
+            time.sleep(0.5)
     except Exception as exc:
-        logger.error("TP order FAILED for %s: %s", symbol, exc)
-
-    # ── Step 6: Submit stop-loss (stop sell) ──────────────────────────
-    sl_ok = False
-    try:
-        sl_result = trading_client.submit_order(order_data=StopOrderRequest(
-            symbol=symbol,
-            qty=qty,
-            stop_price=sl_price,
-            side=OrderSide.SELL,
-            time_in_force=TimeInForce.GTC,
-        ))
-        logger.info("SL order placed for %s: stop sell %d @ $%.2f (order: %s)",
-                     symbol, qty, sl_price, sl_result.id)
-        sl_ok = True
-    except Exception as exc:
-        logger.error("SL order FAILED for %s: %s", symbol, exc)
-
-    # ── Step 7: Warn if exits are incomplete ─────────────────────────
-    if not tp_ok or not sl_ok:
-        logger.warning(
-            "EXIT ORDERS INCOMPLETE for %s — TP: %s, SL: %s. MANUAL INTERVENTION NEEDED.",
-            symbol,
-            "OK" if tp_ok else "FAILED",
-            "OK" if sl_ok else "FAILED",
-        )
+        logger.warning("Could not confirm fill for %s: %s", symbol, exc)
 
     return order
