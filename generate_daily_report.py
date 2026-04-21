@@ -182,10 +182,10 @@ def read_settings() -> dict:
                 "RSI_OVERSOLD",
                 "TP_ATR_MULTIPLIER",
                 "SL_ATR_MULTIPLIER",
+                "LIMIT_BUFFER_DOLLARS",
                 "COOLDOWN_MINUTES",
                 "DAILY_LOSS_LIMIT_PCT",
                 "LOOKBACK_DAYS",
-                "USE_TRAILING_STOP",
             ]:
                 if line.strip().startswith(f"{key}"):
                     m = re.search(r"=\s*(.+?)(?:\s*#|$)", line)

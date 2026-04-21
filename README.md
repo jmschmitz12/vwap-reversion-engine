@@ -1,10 +1,11 @@
 # VWAP Reversion Engine
 
 An automated intraday mean-reversion trading system built on the Alpaca
-brokerage API. The engine scans 15 mega-cap stocks on 5-minute candles
-during a data-optimized afternoon trading window, identifies oversold
-entries using RSI and VWAP, and executes trades with ATR-adaptive exits
-calculated from actual fill prices.
+brokerage API.  The engine scans a curated set of 3 mega-cap stocks on
+5-minute candles during a data-optimized afternoon window, identifies
+oversold entries using RSI and VWAP, and executes trades with
+limit-bracket orders that combine entry and ATR-adaptive exits in a
+single atomic submission.
 
 Deployed on a Raspberry Pi via systemd for fully autonomous operation.
 
@@ -17,94 +18,100 @@ looking for two simultaneous conditions during the afternoon session:
 2. **Price < VWAP** — price is trading below its volume-weighted average,
    confirming the dip has substance.
 
-When both conditions fire, the engine:
+When both conditions fire, the engine submits a **limit bracket order**:
 
-1. Submits a **market buy** order.
-2. Polls for the actual **fill price** (not the signal price).
-3. Calculates **ATR-based exits** from the fill: TP at 1.5× ATR above,
-   SL at 1.0× ATR below — adapting to current volatility.
-4. Submits an **OCO exit order** (limit sell at TP + stop sell at SL).
+1. **Limit buy** at `signal_price + $0.05` — only fills if the price is
+   still in the oversold zone.  If the bounce has already started, the
+   order sits unfilled and is cancelled at the start of the next cycle.
+2. **Take-profit** (child order) at `limit + 1.5 × ATR`.
+3. **Stop-loss** (child order) at `limit - 1.0 × ATR`.
 
-This two-step flow eliminates fill-price drift where exits would be
-misaligned because the market moved between signal and execution.
+Alpaca executes the bracket atomically, so TP and SL cannot desynchronize.
+Using a limit (rather than market) entry prevents the common failure mode
+where a market order chases a reversal and Alpaca rejects the bracket
+because the new market price has moved past the TP or SL.
 
 ## Key Parameters
 
 | Parameter | Value | Rationale |
 |---|---|---|
-| Universe | 15 mega-cap stocks | Institutional dip-buying provides reliable mean reversion |
-| Timeframe | 5-minute candles | 1-min too noisy (PF 1.15), 5-min optimal (PF 1.24) |
-| RSI threshold | < 28 | Optimized from sweep testing (was 30) |
+| Universe | GOOGL, META, AAPL | Only symbols with survivable edge across all friction profiles |
+| Timeframe | 5-minute candles | Balance between signal quality and noise |
+| RSI threshold | < 28 | Consistent oversold across mega-caps |
 | Allocation | 50% of buying power | Per-trade sizing, self-limiting on successive entries |
-| Max positions | 5 | Allows broad participation across the universe |
+| Max positions | 5 | Room to hold all 3 symbols + reserve capacity |
 | TP / SL | 1.5× / 1.0× ATR | Adaptive exits; 1.5:1 reward-to-risk ratio |
-| Trading window | 1:00–3:30 PM ET | Time analysis showed morning entries lose money |
+| Limit buffer | $0.05 | Handle tick noise without chasing bounces |
+| Trading window | 1:00–3:30 PM ET | Afternoon-only outperformed all-day in backtesting |
 | SL cooldown | 30 minutes | Prevents cascading losses on the same ticker |
 | Daily loss limit | 3% | Circuit breaker shuts down entries for the day |
 
-## Backtest Results (Best Proven Config)
+## Realistic Backtest Results
+
+The original backtest used idealized fills (100% execution at signal
+price, zero slippage, zero spread) on a symbol universe that was
+different from what the bot actually traded in production.  After a
+rigorous re-backtest that models realistic frictions, the honest
+picture is:
 
 ```
-Return:          +4.93%  (6 months, ~10% annualized)
-Profit Factor:   1.24
-Sharpe Ratio:    1.54
-Win Rate:        45.4%
-Max Drawdown:    -4.63%
-Avg Win:         $84.28  (+0.39%)
-Avg Loss:        -$56.40 (-0.26%)
-Avg Hold:        30 min
-Trades:          328
+CORE_3 universe (GOOGL, META, AAPL), 180-day backtest
+$25,000 starting capital
+
+Profile         Trades   Fill%   Return     PF    Sharpe  MaxDD
+─────────────────────────────────────────────────────────────────
+IDEALIZED         60     45.1%   +1.71%   1.56    3.14   -0.51%
+MODERATE          59     44.4%   +1.73%   1.56    2.77   -0.52%
+CONSERVATIVE      59     44.0%   +1.12%   1.35    1.77   -0.55%
 ```
+
+The **MODERATE** profile matches observed live behavior: $0.05 limit
+buffer, $0.02 stop-loss slippage, price improvement on fills.  The
+**CONSERVATIVE** profile stacks pessimistic assumptions (strict dip
+requirement, $0.05 SL slippage, 10% TP partial-fill haircut) and the
+strategy still shows positive expectancy.
+
+This is not a "get rich" strategy.  It is an incremental edge that
+needs to be run mechanically and continuously to matter.
 
 ## What Was Tested and Rejected
 
 | Feature | Result | Why rejected |
 |---|---|---|
-| Scanner (dynamic daily picks) | -13.3% return | Gap-down stocks don't mean-revert reliably |
-| 1-minute candles | PF 1.15, Sharpe 0.91 | Too noisy, 4x more trades with worse quality |
-| Trailing stop | Avg win dropped $84→$53 | Mean reversion = short snap, not a trend to ride |
-| Entry filters (VWAP dist, volume, EMA-200) | PF 1.05 | Removed more winners than losers |
-| Conviction sizing | PF 1.05 | Amplified falling-knife losses |
+| 12 additional symbols (CRM, JPM, UNH, MSFT, etc.) | Net losers under friction | Less mean-reversion; spreads eat edge |
+| Market entry orders | 60% bracket rejection rate | Bounce starts before order reaches exchange |
+| Dynamic pre-market scanner | -13.3% return | Gap-down stocks don't mean-revert reliably |
+| 1-minute candles | Noise dominated signal | 4x trades, materially worse quality |
+| Trailing stops | Avg win cut nearly in half | Bounces are short snaps, not trends |
+| Entry filters (VWAP distance, volume, EMA-200) | Lowered PF | Removed more winners than losers |
+| Conviction sizing | Amplified falling-knife losses | Deepest RSI ≠ best entries |
 
 ## Project Structure
 
 ```
 vwap_reversion_engine/
 ├── backtest/
-│   ├── engine.py                # Event-driven backtesting engine
-│   ├── report.py                # Stats, equity curve, per-symbol breakdown
-│   └── scanner_engine.py        # Scanner-aware backtester (disabled)
+│   └── realistic_engine.py        # Friction-aware backtesting engine
 ├── config/
-│   └── settings.py              # All tunable parameters in one place
-├── scanner/
-│   ├── premarket.py             # Gap-down scanner (disabled)
-│   └── universe.py              # ~100 high-cap symbols for scanner
+│   └── settings.py                # All tunable parameters
 ├── src/
-│   ├── bot.py                   # Core loop: signal detection + trade orchestration
-│   ├── data.py                  # Market data fetching via Alpaca
-│   ├── execution.py             # Two-step fill-price-aware order flow
-│   └── indicators.py            # RSI, VWAP, EMA-200, ATR, volume avg
+│   ├── bot.py                     # Core loop: signal detection + orchestration
+│   ├── data.py                    # Market data fetching
+│   ├── execution.py               # Limit-bracket order submission
+│   └── indicators.py              # RSI, VWAP, EMA-200, ATR, volume avg
 ├── utils/
-│   ├── exceptions.py            # Custom exception hierarchy
-│   ├── journal.py               # Trade journal (CSV audit log)
-│   ├── logger.py                # Centralized logging
-│   └── validation.py            # Startup pre-flight checks
+│   ├── exceptions.py              # Custom exception hierarchy
+│   ├── journal.py                 # Trade journal (CSV audit log)
+│   ├── logger.py                  # Centralized logging
+│   └── validation.py              # Startup pre-flight checks
 ├── tests/
-│   └── test_core.py             # Unit tests (offline, no API needed)
-├── logs/
-│   ├── engine.log               # Main engine log
-│   ├── service.log              # systemd service output
-│   ├── trade_journal.csv        # All executed trades
-│   └── daily_reports/           # End-of-day analysis reports
-├── generate_daily_report.py     # Daily summary generator
-├── run_backtest.py              # Fixed-symbol backtest
-├── run_time_analysis.py         # Hour-by-hour P&L breakdown
-├── run_sweep.py                 # Parameter optimization sweep
-├── run_scanner_backtest.py      # Scanner backtest (disabled)
-├── main.py                      # Entry point with scanner toggle
+│   └── test_core.py               # Unit tests (offline, no API needed)
+├── generate_daily_report.py       # End-of-day performance report
+├── run_realistic_backtest.py      # Friction comparison across 3 profiles
+├── run_winners_backtest.py        # Multi-universe subset testing
+├── main.py                        # Entry point for the live engine
 ├── requirements.txt
-├── pyproject.toml
-└── .env.example
+└── pyproject.toml
 ```
 
 ## Prerequisites
@@ -171,30 +178,31 @@ sudo systemctl start vwap-engine.service
 ## Daily Operations
 
 ```bash
-# Check status
+# Check service status
 sudo systemctl status vwap-engine.service
 
 # Watch live logs
 tail -f ~/trading/vwap-reversion-engine/logs/engine.log
 
-# Generate end-of-day report
-python generate_daily_report.py
+# Generate end-of-day report (for a specific date)
+python generate_daily_report.py                # Today
+python generate_daily_report.py 2026-04-20     # Specific date
 
-# Deploy code updates
+# Deploy code updates (laptop → GitHub → Pi)
+# On laptop:
+git commit -am "..." && git push
+# On Pi:
 cd ~/trading/vwap-reversion-engine && git pull && sudo systemctl restart vwap-engine.service
 ```
 
 ## Backtesting
 
 ```bash
-# Run backtest with current settings
-python run_backtest.py
+# Compare idealized vs moderate vs conservative assumptions
+python run_realistic_backtest.py
 
-# Hour-by-hour P&L analysis (identifies best trading windows)
-python run_time_analysis.py
-
-# Parameter optimization sweep
-python run_sweep.py
+# Test multiple curated symbol subsets against all three profiles
+python run_winners_backtest.py
 ```
 
 ## Testing
@@ -204,22 +212,32 @@ pytest
 ```
 
 Tests cover position sizing math, startup validation, and trade journal
-writes. They run entirely offline — no Alpaca credentials required.
+writes.  They run entirely offline — no Alpaca credentials required.
 
-## Optimization History
+## Development History
 
-The system evolved through data-driven iteration:
+The strategy went through six major iterations, with each decision
+driven by backtest data rather than intuition:
 
-1. **Original** — 7 symbols, RSI<30, fixed 0.5%/0.5% exits → PF 1.08, Sharpe 0.59
-2. **Symbol + RSI optimization** — 3 symbols, RSI<28, 0.7%/0.5% → PF 1.23, Sharpe 1.68
-3. **Time filter** — Afternoon only (1–3:30 PM ET) → PF 1.56, Sharpe 3.44
-4. **Expanded universe** — 15 mega-caps at 25% allocation → PF 1.15, Sharpe 1.26
-5. **ATR exits + cooldown + breaker** — Adaptive exits, risk guards → PF 1.24, Sharpe 1.54
-6. **Fill-price fix** — Two-step order flow, exits from actual fill → In production
+1. **Signal discovery** — RSI < 28 + price < VWAP on 5-min candles as
+   the core mean-reversion trigger.
+2. **Time-window filter** — Afternoon-only (1:00-3:30 PM ET) after
+   hour-by-hour analysis showed morning entries consistently lost money.
+3. **ATR-adaptive exits** — Replaced fixed-percentage TP/SL with ATR
+   multiples to adapt to each stock's current volatility.
+4. **Execution hardening** — Multiple iterations to find a reliable
+   Alpaca order flow:  market+OCO (SDK errors) → market+two-sell (share-
+   lock bug) → market+bracket (60% rejection rate) → limit+bracket (✓).
+5. **Realistic backtesting** — Discovered the original PF 1.24 result
+   was on a different symbol universe than production and ignored fill
+   rate, slippage, and spread.  Rebuilt the backtest to model these.
+6. **Symbol curation** — Per-symbol friction analysis identified that
+   only GOOGL, META, and AAPL retained edge under conservative
+   assumptions.  Reduced from 15 symbols to the CORE_3 set.
 
 ## Disclaimer
 
-This software is for **educational and research purposes only**. Automated
-trading carries substantial risk of financial loss. Past performance of any
-strategy does not guarantee future results. Always test thoroughly with paper
-trading before risking real capital.
+This software is for **educational and research purposes only**.
+Automated trading carries substantial risk of financial loss.  Past
+performance of any strategy does not guarantee future results.  Always
+test thoroughly with paper trading before risking real capital.

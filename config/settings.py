@@ -2,7 +2,7 @@
 Centralized configuration for the VWAP Reversion Engine.
 
 All tunable parameters are defined here so the rest of the codebase
-stays free of magic numbers. API credentials are loaded from a .env
+stays free of magic numbers.  API credentials are loaded from a .env
 file and never committed to version control.
 """
 
@@ -19,26 +19,21 @@ API_KEY: str = os.getenv("ALPACA_API_KEY", "")
 SECRET_KEY: str = os.getenv("ALPACA_SECRET_KEY", "")
 
 # ── Ticker Universe ──────────────────────────────────────────────────────────
-# Mega-cap names with high institutional ownership where afternoon
-# dips get bought by fund rebalancing.  Curated from backtest and
-# scanner analysis — speculative/mid-cap names excluded.
+# CORE_3 — The only symbols that demonstrated survivable edge across
+# all three friction profiles (idealized, moderate, conservative) in
+# the realistic backtest.  12 other symbols were tested and dropped:
+# they either had inconsistent results or were net losers once real
+# frictions (slippage, fill rate, spread) were modeled.
+#
+# Conservative profile on CORE_3 (180-day backtest):
+#   - PF 1.35, Sharpe 1.77, max drawdown 0.55%
+#   - 59 trades, 50.8% win rate
+#   - +1.12% return under pessimistic assumptions
 
 TARGET_SYMBOLS: list[str] = [
-    "AAPL",   # Apple
-    "MSFT",   # Microsoft
     "GOOGL",  # Alphabet
     "META",   # Meta Platforms
-    "AMZN",   # Amazon
-    "AMD",    # AMD
-    "AVGO",   # Broadcom
-    "CRM",    # Salesforce
-    "NFLX",   # Netflix
-    "QCOM",   # Qualcomm
-    "LLY",    # Eli Lilly
-    "JPM",    # JPMorgan Chase
-    "GS",     # Goldman Sachs
-    "UNH",    # UnitedHealth
-    "ADBE",   # Adobe
+    "AAPL",   # Apple
 ]
 
 # ── Data Parameters ──────────────────────────────────────────────────────────
@@ -50,44 +45,21 @@ LOOKBACK_DAYS: int = 5              # Enough bars for EMA-200 warm-up
 
 RSI_OVERSOLD: int = 28
 
-# ── Entry Quality Filters ────────────────────────────────────────────────────
-# Tested and disabled — degraded performance vs base config.
-
-VWAP_DISTANCE_PCT: float = 0.0
-VOLUME_MULTIPLIER: float = 0.0
-USE_EMA_TREND_FILTER: bool = False
-
 # ── Position Sizing & Risk ───────────────────────────────────────────────────
 
 ALLOCATION_PERCENT: float = 0.50       # 50% of available buying power per trade
 MAX_OPEN_POSITIONS: int = 5            # Up to 5 simultaneous positions
 
-# ── Conviction Sizing ────────────────────────────────────────────────────────
+# ── Exit Strategy (ATR-based) ────────────────────────────────────────────────
+# Exits are calculated from the LIMIT price (which equals the fill price
+# since we use limit entries), ensuring TP/SL are always correctly
+# distanced from the actual entry point.
 
-USE_CONVICTION_SIZING: bool = False
-CONVICTION_MAX_MULTIPLIER: float = 1.5
-
-# ── Exit Strategy ────────────────────────────────────────────────────────────
-# ATR-based exits calculated from the LIMIT entry price (see below).
-# Since we use limit entry orders, the fill price equals the limit price,
-# so exits are always correctly distanced from the actual entry.
-
-USE_ATR_EXITS: bool = True
-TP_ATR_MULTIPLIER: float = 1.5        # Take-profit = limit + 1.5 x ATR
-SL_ATR_MULTIPLIER: float = 1.0        # Stop-loss   = limit - 1.0 x ATR
-
-# Trailing stop — tested and disabled (mean reversion bounces are
-# short snaps, not trends to ride; reduced avg win from $84 to $53).
-USE_TRAILING_STOP: bool = False
-TRAIL_ACTIVATION_ATR: float = 1.0
-TRAIL_DISTANCE_ATR: float = 0.5
-
-# Fallback fixed exits (used when ATR unavailable)
-TP_PERCENT: float = 0.007
-SL_PERCENT: float = 0.005
+TP_ATR_MULTIPLIER: float = 1.5        # Take-profit = limit + 1.5 × ATR
+SL_ATR_MULTIPLIER: float = 1.0        # Stop-loss   = limit - 1.0 × ATR
 
 # ── Limit Entry ──────────────────────────────────────────────────────────────
-# Buffer above signal price for the limit buy. Prevents chasing bounces
+# Buffer above signal price for the limit buy.  Prevents chasing bounces
 # (signals often fire just before the reversal begins) while still
 # handling normal bid-ask tick noise.
 #
@@ -99,24 +71,22 @@ LIMIT_BUFFER_DOLLARS: float = 0.05
 
 # ── Risk Guards ──────────────────────────────────────────────────────────────
 
-COOLDOWN_MINUTES: int = 30
-DAILY_LOSS_LIMIT_PCT: float = 0.03     # 3% daily loss limit
+COOLDOWN_MINUTES: int = 30             # No re-entry on a stopped-out symbol
+DAILY_LOSS_LIMIT_PCT: float = 0.03     # 3% daily loss → circuit breaker
 
 # ── Execution Mode ───────────────────────────────────────────────────────────
 
 PAPER_TRADING: bool = True
 
-# ── Trading Window (Eastern Time) ────────────────────────────────────────────
+# ── Trading Window (UTC) ─────────────────────────────────────────────────────
+# 1:00-3:30 PM ET = 17:00-19:30 UTC (during DST).
+# Time-of-day backtesting showed morning entries consistently lose money
+# for this strategy; afternoon-only trading was a key edge discovery.
 
-TRADING_START_HOUR_UTC: int = 17       # 1:00 PM ET = 17:00 UTC
-TRADING_END_HOUR_UTC: int = 19         # 3:00 PM ET = 19:00 UTC
-TRADING_END_MINUTE_UTC: int = 30       # 3:30 PM ET = 19:30 UTC
-
-# ── Scanner Mode ─────────────────────────────────────────────────────────────
-
-USE_SCANNER: bool = False
-SCANNER_MAX_CANDIDATES: int = 5
+TRADING_START_HOUR_UTC: int = 17
+TRADING_END_HOUR_UTC: int = 19
+TRADING_END_MINUTE_UTC: int = 30
 
 # ── Scheduling ───────────────────────────────────────────────────────────────
 
-CYCLE_INTERVAL_SEC: int = 300
+CYCLE_INTERVAL_SEC: int = 300          # Match the 5-minute candle timeframe

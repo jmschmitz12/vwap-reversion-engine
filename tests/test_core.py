@@ -28,17 +28,17 @@ class TestCalculatePositionSize:
 
     def test_standard_allocation(self) -> None:
         qty = _calculate_position_size(buying_power=100_000, current_price=250.0)
-        # 10% of 100k = 10k → 10_000 / 250 = 40 shares
-        assert qty == 40
+        # 50% of 100k = 50k → 50_000 / 250 = 200 shares
+        assert qty == 200
 
     def test_rounds_down_to_whole_shares(self) -> None:
         qty = _calculate_position_size(buying_power=10_000, current_price=333.0)
-        # 10% of 10k = 1000 → 1000 / 333 = 3.003 → floor to 3
-        assert qty == 3
+        # 50% of 10k = 5000 → 5000 / 333 = 15.01 → floor to 15
+        assert qty == 15
 
     def test_returns_zero_when_allocation_too_small(self) -> None:
         qty = _calculate_position_size(buying_power=500, current_price=600.0)
-        # 10% of 500 = 50 → 50 / 600 = 0.08 → floor to 0
+        # 50% of 500 = 250 → 250 / 600 = 0.42 → floor to 0
         assert qty == 0
 
     def test_custom_allocation_percent(self) -> None:
@@ -50,8 +50,8 @@ class TestCalculatePositionSize:
 
     def test_high_priced_stock(self) -> None:
         qty = _calculate_position_size(buying_power=25_000, current_price=4_500.0)
-        # 10% of 25k = 2500 → 2500 / 4500 = 0.55 → floor to 0
-        assert qty == 0
+        # 50% of 25k = 12500 → 12500 / 4500 = 2.78 → floor to 2
+        assert qty == 2
 
 
 # ── Environment Validation ───────────────────────────────────────────────────

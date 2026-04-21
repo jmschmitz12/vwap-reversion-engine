@@ -41,10 +41,7 @@ from config.settings import (
     PAPER_TRADING,
     SECRET_KEY,
     SL_ATR_MULTIPLIER,
-    SL_PERCENT,
     TP_ATR_MULTIPLIER,
-    TP_PERCENT,
-    USE_ATR_EXITS,
 )
 from utils.journal import record_trade
 from utils.logger import logger
@@ -159,17 +156,14 @@ def submit_entry_with_exits(
     Returns:
         The entry order object on success, or ``None`` on failure.
     """
-    # ── Calculate entry limit and exits ──────────────────────────────
-    limit_price = round(signal_price + LIMIT_BUFFER_DOLLARS, 2)
+    # ── Calculate entry limit and exits (ATR-based only) ─────────────
+    if atr <= 0:
+        logger.warning("[%s] ATR unavailable -- skipping entry.", symbol)
+        return None
 
-    if USE_ATR_EXITS and atr > 0:
-        tp_price = round(limit_price + (atr * TP_ATR_MULTIPLIER), 2)
-        sl_price = round(limit_price - (atr * SL_ATR_MULTIPLIER), 2)
-        exit_mode = "ATR"
-    else:
-        tp_price = round(limit_price * (1 + TP_PERCENT), 2)
-        sl_price = round(limit_price * (1 - SL_PERCENT), 2)
-        exit_mode = "FIXED"
+    limit_price = round(signal_price + LIMIT_BUFFER_DOLLARS, 2)
+    tp_price = round(limit_price + (atr * TP_ATR_MULTIPLIER), 2)
+    sl_price = round(limit_price - (atr * SL_ATR_MULTIPLIER), 2)
 
     # ── Sanity check: TP must be above limit by at least $0.01 ───────
     if tp_price <= limit_price:
@@ -200,8 +194,8 @@ def submit_entry_with_exits(
             stop_loss=StopLossRequest(stop_price=sl_price),
         ))
         logger.info(
-            "LIMIT BRACKET submitted: %d x %s @ limit $%.2f (signal: $%.2f) | TP: $%.2f | SL: $%.2f | %s",
-            qty, symbol, limit_price, signal_price, tp_price, sl_price, exit_mode,
+            "LIMIT BRACKET submitted: %d x %s @ limit $%.2f (signal: $%.2f) | TP: $%.2f | SL: $%.2f",
+            qty, symbol, limit_price, signal_price, tp_price, sl_price,
         )
     except Exception as exc:
         logger.error("Limit bracket FAILED for %s: %s", symbol, exc)
