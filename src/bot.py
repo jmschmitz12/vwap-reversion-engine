@@ -2,8 +2,8 @@
 Core bot loop — signal detection and trade orchestration.
 
 Each call to :func:`run_bot_iteration` represents one complete
-analysis cycle: fetch data -> compute indicators -> scan for signals ->
-execute qualifying trades.
+analysis cycle: cancel stale limits -> fetch data -> compute indicators ->
+scan for signals -> execute qualifying trades.
 """
 
 import pandas as pd
@@ -19,6 +19,7 @@ from config.settings import (
 )
 from src.data import fetch_intraday_data
 from src.execution import (
+    cancel_stale_limit_orders,
     get_buying_power,
     get_open_position_symbols,
     submit_entry_with_exits,
@@ -39,10 +40,9 @@ def _calculate_position_size(
 
 
 def _is_in_trading_window() -> bool:
-    """Return ``True`` if the current UTC time falls within the entry window.
+    """Return ``True`` if current UTC time falls within the entry window.
 
-    This is a FREE check (no API call) — always run this before
-    _is_market_open() to avoid unnecessary Alpaca requests.
+    Free local check — no API call.
     """
     from datetime import datetime, timezone
 
@@ -54,11 +54,7 @@ def _is_in_trading_window() -> bool:
 
 
 def _is_market_open() -> bool:
-    """Return ``True`` if the market is currently in a regular session.
-
-    This makes an API call to Alpaca — only call after confirming
-    we're inside the trading window.
-    """
+    """Return ``True`` if market is in a regular session (API call)."""
     try:
         clock = trading_client.get_clock()
         return clock.is_open
@@ -71,37 +67,38 @@ def run_bot_iteration(symbols: list[str] | None = None) -> None:
     """Execute a single analysis-and-trade cycle.
 
     Args:
-        symbols: Tickers to scan this cycle. Falls back to
-            ``TARGET_SYMBOLS`` if not provided.
+        symbols: Tickers to scan. Falls back to ``TARGET_SYMBOLS``.
     """
     active_symbols = symbols or TARGET_SYMBOLS
     logger.info("-- Starting analysis cycle (%d symbols) --", len(active_symbols))
 
-    # -- Pre-flight checks (ordered cheapest-first) --
-
-    # 1. Trading window (free local check — no API call)
+    # 1. Trading window (free local check)
     if not _is_in_trading_window():
         logger.info("Outside trading window (17:00-19:30 UTC) -- skipping entries.")
         return
 
-    # 2. Market open (API call — only reached during the window)
+    # 2. Market open (API call)
     if not _is_market_open():
         logger.info("Market is closed -- skipping this cycle.")
         return
 
-    # 3. Position capacity (single API call — get current positions)
+    # 3. Cancel any stale limit orders from prior cycle
+    cancelled = cancel_stale_limit_orders()
+    if cancelled > 0:
+        logger.info("Cancelled %d stale limit order(s) before this cycle.", cancelled)
+
+    # 4. Check position capacity
     open_symbols: set[str] = get_open_position_symbols()
     current_position_count = len(open_symbols)
 
     if current_position_count >= MAX_OPEN_POSITIONS:
         logger.info(
             "At position cap (%d/%d) -- no new entries allowed.",
-            current_position_count,
-            MAX_OPEN_POSITIONS,
+            current_position_count, MAX_OPEN_POSITIONS,
         )
         return
 
-    # -- Data & Indicators --
+    # 5. Fetch data and compute indicators
     raw_df = fetch_intraday_data(symbols=active_symbols)
     if raw_df is None:
         return
@@ -110,9 +107,8 @@ def run_bot_iteration(symbols: list[str] | None = None) -> None:
     if df is None:
         return
 
-    # -- Signal Scan --
+    # 6. Scan for signals
     for symbol in active_symbols:
-        # Check capacity using local counter (no API call)
         if current_position_count >= MAX_OPEN_POSITIONS:
             logger.info("Position cap reached during scan -- stopping.")
             break
@@ -132,21 +128,15 @@ def run_bot_iteration(symbols: list[str] | None = None) -> None:
 
             if pd.isna(rsi):
                 continue
-
-            # Handle NaN ATR
             if pd.isna(atr):
                 atr = 0.0
 
             logger.info(
                 "[%s] Price: $%.2f | RSI: %.2f | VWAP: $%.2f | ATR: $%.2f",
-                symbol,
-                current_price,
-                rsi,
-                vwap,
-                atr,
+                symbol, current_price, rsi, vwap, atr,
             )
 
-            # Mean-reversion entry: oversold + trading below VWAP
+            # Mean-reversion entry: oversold + below VWAP
             if rsi < RSI_OVERSOLD and current_price < vwap:
                 logger.info("*** BUY SIGNAL -- %s ***", symbol)
 
@@ -168,7 +158,6 @@ def run_bot_iteration(symbols: list[str] | None = None) -> None:
                     atr=atr,
                 )
 
-                # Track locally so we don't need another API call
                 if result is not None:
                     open_symbols.add(symbol)
                     current_position_count += 1

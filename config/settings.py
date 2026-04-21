@@ -68,13 +68,13 @@ USE_CONVICTION_SIZING: bool = False
 CONVICTION_MAX_MULTIPLIER: float = 1.5
 
 # ── Exit Strategy ────────────────────────────────────────────────────────────
-# ATR-based exits calculated from ACTUAL FILL PRICE (not signal price).
-# The live engine submits a market order first, gets the fill, then
-# submits exit orders based on the real entry.
+# ATR-based exits calculated from the LIMIT entry price (see below).
+# Since we use limit entry orders, the fill price equals the limit price,
+# so exits are always correctly distanced from the actual entry.
 
 USE_ATR_EXITS: bool = True
-TP_ATR_MULTIPLIER: float = 1.5        # Take-profit = fill + 1.5 x ATR
-SL_ATR_MULTIPLIER: float = 1.0        # Stop-loss   = fill - 1.0 x ATR
+TP_ATR_MULTIPLIER: float = 1.5        # Take-profit = limit + 1.5 x ATR
+SL_ATR_MULTIPLIER: float = 1.0        # Stop-loss   = limit - 1.0 x ATR
 
 # Trailing stop — tested and disabled (mean reversion bounces are
 # short snaps, not trends to ride; reduced avg win from $84 to $53).
@@ -85,6 +85,17 @@ TRAIL_DISTANCE_ATR: float = 0.5
 # Fallback fixed exits (used when ATR unavailable)
 TP_PERCENT: float = 0.007
 SL_PERCENT: float = 0.005
+
+# ── Limit Entry ──────────────────────────────────────────────────────────────
+# Buffer above signal price for the limit buy. Prevents chasing bounces
+# (signals often fire just before the reversal begins) while still
+# handling normal bid-ask tick noise.
+#
+# If the market bounces more than $0.05 between signal and order
+# arrival, the order sits unfilled and gets cancelled at the start
+# of the next cycle.
+
+LIMIT_BUFFER_DOLLARS: float = 0.05
 
 # ── Risk Guards ──────────────────────────────────────────────────────────────
 
